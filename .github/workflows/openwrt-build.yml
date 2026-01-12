@@ -169,47 +169,46 @@ jobs:
 
     # 仅依赖缓存未命中时执行下载
 - name: 智能下载编译依赖包（GitHub优先，官方备用）
-  if: steps.cache-dl.outputs.cache-hit != 'true'
-  run: |
-    cd openwrt
-    make defconfig
-    export DOWNLOAD_TIMEOUT=300
+      if: steps.cache-dl.outputs.cache-hit != 'true'
+      run: |
+        cd openwrt
+        make defconfig
+        export DOWNLOAD_TIMEOUT=300
 
-    # 1. 初始配置：OpenWRT GitHub下载镜像源（优先）
-    # 适配21.02版本：宽松匹配downloads.openwrt.org域名
-    sed -i 's@downloads.openwrt.org@github.com/openwrt/releases-mirror/raw/master@g' ./include/download.mk
-    echo "📜 初始依赖配置（GitHub优先源）："
-    grep -n "github.com/openwrt/releases-mirror" ./include/download.mk
+        # 1. 初始配置：OpenWRT GitHub下载镜像源（优先）
+        sed -i 's@https://downloads.openwrt.org/@https://github.com/openwrt/releases-mirror/raw/master/@g' ./include/download.mk
+        echo "📜 初始依赖配置（GitHub优先源）："
+        grep -n "github.com/openwrt/releases-mirror" ./include/download.mk
 
-    # 2. GitHub源尝试2次（多线程）
-    echo -e "\033[34m🔹 第1次尝试：GitHub镜像源下载依赖（多线程）\033[0m"
-    make download -j4 V=s > download.log 2>&1
-    if [ $? -ne 0 ]; then
-      echo -e "\033[33m⚠️  GitHub源第1次失败，重试第2次\033[0m"
-      make download -j4 V=s > download_2.log 2>&1
-      if [ $? -ne 0 ]; then
-        echo -e "\033[31m❌ GitHub源连续2次失败，切换官方备用源\033[0m"
-        # 3. 切换到官方备用源（还原downloads.openwrt.org）
-        sed -i 's@github.com/openwrt/releases-mirror/raw/master@downloads.openwrt.org@g' ./include/download.mk
-        echo "📜 临时依赖配置（官方备用源）："
-        grep -n "downloads.openwrt.org" ./include/download.mk
-        # 4. 官方备用源单线程下载
-        echo -e "\033[34m🔹 尝试：官方备用源下载依赖（单线程）\033[0m"
-        make download -j1 V=s
+        # 2. GitHub源尝试2次（多线程）
+        echo -e "\033[34m🔹 第1次尝试：GitHub镜像源下载依赖（多线程）\033[0m"
+        make download -j4 V=s > download.log 2>&1
         if [ $? -ne 0 ]; then
-          echo -e "\033[31m❌ 官方备用源也失败，终止流程\033[0m"
-          exit 1
+          echo -e "\033[33m⚠️  GitHub源第1次失败，重试第2次\033[0m"
+          make download -j4 V=s > download_2.log 2>&1
+          if [ $? -ne 0 ]; then
+            echo -e "\033[31m❌ GitHub源连续2次失败，切换官方备用源\033[0m"
+            # 3. 切换到官方备用源
+            sed -i 's@https://github.com/openwrt/releases-mirror/raw/master/@https://downloads.openwrt.org/@g' ./include/download.mk
+            echo "📜 临时依赖配置（官方备用源）："
+            grep -n "downloads.openwrt.org" ./include/download.mk
+            # 4. 官方备用源单线程下载
+            echo -e "\033[34m🔹 尝试：官方备用源下载依赖（单线程）\033[0m"
+            make download -j1 V=s
+            if [ $? -ne 0 ]; then
+              echo -e "\033[31m❌ 官方备用源也失败，终止流程\033[0m"
+              exit 1
+            fi
+            echo -e "\033[32m✅ 官方备用源成功，切回GitHub优先源\033[0m"
+            # 5. 切回GitHub源（恢复优先配置）
+            sed -i 's@https://downloads.openwrt.org/@https://github.com/openwrt/releases-mirror/raw/master/@g' ./include/download.mk
+          fi
         fi
-        echo -e "\033[32m✅ 官方备用源成功，切回GitHub优先源\033[0m"
-        # 5. 切回GitHub源（恢复优先配置）
-        sed -i 's@downloads.openwrt.org@github.com/openwrt/releases-mirror/raw/master@g' ./include/download.mk
-      fi
-    fi
 
-    # 6. 清理无效依赖包
-    find dl -size -1024c -exec ls -l {} \;
-    find dl -size -1024c -exec rm -f {} \;
-    echo -e "\033[32m✅ 依赖包下载完成\033[0m"
+        # 6. 清理无效依赖包
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+        echo -e "\033[32m✅ 依赖包下载完成\033[0m"
 
     # 依赖缓存命中提示
     - name: 依赖缓存命中提示
