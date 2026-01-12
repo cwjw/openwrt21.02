@@ -59,16 +59,6 @@ jobs:
 - name: 更新feeds并安装（增加重试+github镜像）
   run: |
     cd openwrt
-    # 清空原有feeds配置，写入GitHub源（使用;指定21.02分支）
-      # > feeds.conf.default  # 清空原有配置
-     #  cat > feeds.conf.default < EOF
-  # 	src-git base https://github.com/openwrt/openwrt.git;openwrt-21.02
-	  # src-git packages https://github.com/openwrt/packages.git;openwrt-21.02
-	  # src-git luci https://github.com/openwrt/luci.git;openwrt-21.02
-	  # src-git routing https://github.com/openwrt/routing.git;openwrt-21.02
-	  # src-git telephony https://github.com/openwrt/telephony.git;openwrt-21.02
-	  # src-git netifd https://github.com/openwrt/netifd.git;openwrt-21.02
-  # EOF
     # 保留三次重试逻辑，提升下载成功率
     ./scripts/feeds update -a || ./scripts/feeds update -a || ./scripts/feeds update -a
     ./scripts/feeds install -a
