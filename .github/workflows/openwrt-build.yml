@@ -38,10 +38,9 @@ jobs:
         sudo apt-get autoremove -y $APT_OPTIONS
         sudo apt-get clean -y $APT_OPTIONS
 
-    - name: 克隆OpenWRT 21.02源码（改用GitHub镜像）
+    - name: 克隆OpenWRT 21.02源码
       run: |
-        # 替换为GitHub上的OpenWRT镜像仓库
-        git clone https://github.com/openwrt/openwrt.git openwrt
+        git clone https://git.openwrt.org/openwrt/openwrt.git openwrt
         cd openwrt
         git checkout v21.02.7
         echo "当前OpenWRT版本：$(git describe --tags)"
@@ -57,24 +56,22 @@ jobs:
           exit 1
         fi
 
-    - name: 更新feeds并安装（改为GitHub源+增加重试）
-      run: |
-        cd openwrt
-        # 替换feeds源为GitHub官方仓库，移除清华镜像
-        sed -i '/^src-git/d' feeds.conf.default  # 清空原有feeds配置
-        # 重新写入基于GitHub的feeds源
-        cat > feeds.conf.default << EOF
-src-git packages https://github.com/openwrt/packages.git^openwrt-21.02
-src-git luci https://github.com/openwrt/luci.git^openwrt-21.02
-src-git routing https://github.com/openwrt/routing.git^openwrt-21.02
-src-git telephony https://github.com/openwrt/telephony.git^openwrt-21.02
-src-git targets https://github.com/openwrt/targets.git^openwrt-21.02
-src-git management https://github.com/openwrt/management.git^openwrt-21.02
-src-git oldpackages https://github.com/openwrt/oldpackages.git^openwrt-21.02
-src-link custom ./package/custom
+- name: 更新feeds并安装（增加重试+github镜像）
+  run: |
+    cd openwrt
+    # 清空原有feeds配置，写入GitHub源（使用;指定21.02分支）
+    > feeds.conf.default  # 清空原有配置
+    cat >> feeds.conf.default << EOF
+src-git base https://github.com/openwrt/openwrt.git;openwrt-21.02
+src-git packages https://github.com/openwrt/packages.git;openwrt-21.02
+src-git luci https://github.com/openwrt/luci.git;openwrt-21.02
+src-git routing https://github.com/openwrt/routing.git;openwrt-21.02
+src-git telephony https://github.com/openwrt/telephony.git;openwrt-21.02
+src-git netifd https://github.com/openwrt/netifd.git;openwrt-21.02
 EOF
-        ./scripts/feeds update -a || ./scripts/feeds update -a || ./scripts/feeds update -a
-        ./scripts/feeds install -a
+    # 保留三次重试逻辑，提升下载成功率
+    ./scripts/feeds update -a || ./scripts/feeds update -a || ./scripts/feeds update -a
+    ./scripts/feeds install -a
 
     - name: 下载编译依赖包（改为-j8并发）
       run: |
