@@ -56,12 +56,12 @@ jobs:
           exit 1
         fi
 
-- name: 更新feeds并安装（增加重试+github镜像）
-  run: |
-    cd openwrt
-    # 保留三次重试逻辑，提升下载成功率
-    ./scripts/feeds update -a || ./scripts/feeds update -a || ./scripts/feeds update -a
-    ./scripts/feeds install -a
+    - name: 更新feeds并安装（增加重试）
+      run: |
+        cd openwrt
+        # 替换feeds源为清华镜像，提升下载速度
+        ./scripts/feeds update -a || ./scripts/feeds update -a || ./scripts/feeds update -a
+        ./scripts/feeds install -a
 
     - name: 下载编译依赖包（改为-j8并发）
       run: |
