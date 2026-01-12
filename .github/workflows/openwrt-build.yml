@@ -19,6 +19,7 @@ jobs:
       with:
         fetch-depth: 1
 
+    # 优化网络配置
     - name: 优化网络配置
       run: |
         echo "max-time = 300" >> ~/.curlrc
@@ -28,267 +29,120 @@ jobs:
         git config --global https.timeout 300
         git config --global http.retry 2
 
+    # 缓存apt包（加速依赖安装）
     - name: 缓存apt包缓存
       uses: actions/cache@v3
       id: cache-apt
       with:
         path: /var/cache/apt/archives
-        key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/openwrt-build.yml') }}
+        key: ${{ runner.os }}-apt-${{ github.sha }}
         restore-keys: |
           ${{ runner.os }}-apt-
 
-    - name: 缓存编译环境
-      uses: actions/cache@v3
-      id: cache-env
-      with:
-        path: |
-          /usr/local
-          /usr/lib
-          /usr/bin
-          /usr/include
-          /bin
-          /sbin
-        key: ${{ runner.os }}-openwrt-21.02-env-full-${{ hashFiles('.github/workflows/openwrt-build.yml') }}
-        restore-keys: |
-          ${{ runner.os }}-openwrt-21.02-env-full-
-
-    - name: 验证并配置编译环境
+    # 安装编译依赖（直接全量安装，避免检查缺失）
+    - name: 安装OpenWRT编译依赖
       env:
         DEBIAN_FRONTEND: noninteractive
-        APT_LISTCHANGES_FRONTEND: none
-        APT_OPTIONS: '-o Dpkg::Use-Pty=0 -o APT::Color=0 -q'
       run: |
-        REQUIRED_PACKAGES=(
-          build-essential clang flex bison g++ gawk gcc-multilib g++-multilib
-          gettext git libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget
+        sudo apt-get update -y
+        sudo apt-get install -y \
+          build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+          gettext git libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget \
           libelf-dev ecj fastjar java-propose-classpath bc
-        )
+        sudo apt-get clean -y
 
-        MISSING_PACKAGES=()
-        for pkg in "${REQUIRED_PACKAGES[@]}"; do
-          if ! dpkg -s "$pkg" >/dev/null 2>&1; then
-            MISSING_PACKAGES+=("$pkg")
-            echo "⚠️ 缺失依赖：$pkg"
-          fi
-        done
-
-        if [ ${#MISSING_PACKAGES[@]} -gt 0 ]; then
-          echo "📦 安装缺失的编译依赖（共${#MISSING_PACKAGES[@]}个）"
-          sudo apt-get update -y $APT_OPTIONS
-          sudo apt-get install -y $APT_OPTIONS "${MISSING_PACKAGES[@]}"
-          sudo apt-get autoremove -y $APT_OPTIONS
-          sudo apt-get clean -y $APT_OPTIONS
-        else
-          echo -e "\033[32m✅ 所有编译依赖已存在，跳过环境配置\033[0m"
-          gcc --version | head -1
-          make --version | head -1
-          git --version | head -1
-        fi
-
-    # ========== 修复核心：克隆官方源码并验证文件 ==========
-    - name: 克隆OpenWRT源码并切换版本
+    # 克隆OpenWRT源码（兼容任意仓库，优先官方）
+    - name: 克隆OpenWRT源码
       run: |
         rm -rf ./openwrt
-        # 克隆官方21.02.7版本（--depth=1 减少克隆体积）
-        git clone --depth=1 --branch=v21.02.7 https://github.com/openwrt/openwrt.git openwrt
-        # 验证关键文件是否存在
+        # 可选1：克隆官方21.02.7（推荐）
+        git clone --depth=1 https://github.com/openwrt/openwrt.git -b v21.02.7 openwrt || \
+        # 可选2：克隆你的第三方仓库（备用）
+        git clone --depth=1 https://github.com/cwjw/OpenWRT.git openwrt
+        
+        # 强制检查目录是否存在
         if [ ! -d "./openwrt" ]; then
-          echo "❌ 克隆仓库失败"
+          echo "❌ 克隆仓库失败，终止流程"
           exit 1
         fi
-        if [ ! -f "./openwrt/include/site.mk" ]; then
-          echo "❌ 缺少核心文件 include/site.mk"
-          exit 1
-        fi
-        cd openwrt
-        echo "✅ 成功克隆官方OpenWRT v21.02.7，目录结构完整"
+        echo "✅ 成功克隆OpenWRT源码"
 
-    - name: 复制.config到OpenWRT目录
+    # 复制配置文件
+    - name: 复制.config配置文件
       run: |
         cp -f ./.config ./openwrt/.config
-        if [ -f ./openwrt/.config ]; then
-          echo "✅ .config 文件已复制"
-          head -10 ./openwrt/.config
-        else
-          echo "❌ 未找到.config文件，终止编译"
+        if [ ! -f "./openwrt/.config" ]; then
+          echo "❌ 未找到.config文件，终止流程"
           exit 1
         fi
+        echo "✅ .config文件已复制"
 
-    - name: 缓存feeds内容
-      id: cache-feeds
-      uses: actions/cache@v3
-      with:
-        path: |
-          ./openwrt/feeds
-          ./openwrt/staging_dir/feeds
-          ./openwrt/package/feeds
-        key: ${{ runner.os }}-openwrt-21.02-feeds-${{ hashFiles('./openwrt/.config', './openwrt/feeds.conf.default') }}
-        restore-keys: |
-          ${{ runner.os }}-openwrt-21.02-feeds-
-
-    - name: 智能更新feeds
-      if: steps.cache-feeds.outputs.cache-hit != 'true'
+    # 更新feeds（跳过源替换）
+    - name: 更新feeds
       run: |
         cd openwrt
-        > feeds.conf.default
-        echo "src-git packages https://github.com/openwrt/packages.git;openwrt-21.02" >> feeds.conf.default
+        # 重置feeds配置为官方源
+        echo "src-git packages https://github.com/openwrt/packages.git;openwrt-21.02" > feeds.conf.default
         echo "src-git luci https://github.com/openwrt/luci.git;openwrt-21.02" >> feeds.conf.default
         echo "src-git routing https://github.com/openwrt/routing.git;openwrt-21.02" >> feeds.conf.default
         echo "src-git telephony https://github.com/openwrt/telephony.git;openwrt-21.02" >> feeds.conf.default
-        echo "📜 初始feeds配置："
-        cat feeds.conf.default
-
-        echo -e "\033[34m🔹 第1次尝试：GitHub源更新feeds\033[0m"
-        ./scripts/feeds update -a > feeds_update.log 2>&1
-        if [ $? -ne 0 ]; then
-          echo -e "\033[33m⚠️ GitHub源失败，重试第2次\033[0m"
-          ./scripts/feeds update -a > feeds_update_2.log 2>&1
-          if [ $? -ne 0 ]; then
-            echo -e "\033[31m❌ GitHub源失败，切换官方源\033[0m"
-            > feeds.conf.default
-            echo "src-git packages https://git.openwrt.org/feed/packages.git^48242ee7a190db7740f7b9b3ef1debfa4d5857f6" >> feeds.conf.default
-            echo "src-git luci https://git.openwrt.org/project/luci.git^e98243ef9eb838cca80cdd6d1bd0cf69a509d103" >> feeds.conf.default
-            echo "src-git routing https://git.openwrt.org/feed/routing.git^8071852b4556a02533cacb7a0f6a432df3507302" >> feeds.conf.default
-            echo "src-git telephony https://git.openwrt.org/feed/telephony.git^920fbc5c0a2e4badf51bceff42e9a1e3eb693462" >> feeds.conf.default
-            ./scripts/feeds update -a
-            if [ $? -ne 0 ]; then
-              echo -e "\033[31m❌ 官方源也失败，终止流程\033[0m"
-              exit 1
-            fi
-            > feeds.conf.default
-            echo "src-git packages https://github.com/openwrt/packages.git;openwrt-21.02" >> feeds.conf.default
-            echo "src-git luci https://github.com/openwrt/luci.git;openwrt-21.02" >> feeds.conf.default
-            echo "src-git routing https://github.com/openwrt/routing.git;openwrt-21.02" >> feeds.conf.default
-            echo "src-git telephony https://github.com/openwrt/telephony.git;openwrt-21.02" >> feeds.conf.default
-          fi
-        fi
-
+        
+        # 执行feeds更新（失败重试）
+        ./scripts/feeds update -a || ./scripts/feeds update -a
         ./scripts/feeds install -a
-        echo -e "\033[32m✅ feeds更新完成\033[0m"
+        echo "✅ feeds更新完成"
 
-    - name: feeds缓存命中提示
-      if: steps.cache-feeds.outputs.cache-hit == 'true'
-      run: |
-        echo -e "\033[32m✅ feeds缓存命中，跳过更新\033[0m"
-        ls -lh ./openwrt/feeds | head -10
-
+    # 缓存依赖包目录
     - name: 缓存编译依赖包
-      id: cache-dl
       uses: actions/cache@v3
+      id: cache-dl
       with:
         path: ./openwrt/dl
-        key: ${{ runner.os }}-openwrt-21.02-dl-${{ hashFiles('./openwrt/.config') }}
+        key: ${{ runner.os }}-openwrt-dl-${{ hashFiles('./openwrt/.config') }}
         restore-keys: |
-          ${{ runner.os }}-openwrt-21.02-dl-
+          ${{ runner.os }}-openwrt-dl-
 
-    # ========== 修复后：能正确找到site.mk并替换源 ==========
-    - name: 智能下载编译依赖包
+    # 下载依赖包（核心修复：跳过sed，直接下载）
+    - name: 下载编译依赖包
       if: steps.cache-dl.outputs.cache-hit != 'true'
       run: |
         cd openwrt
+        # 生成配置（必选步骤）
         make defconfig
+        # 设置超时时间
         export DOWNLOAD_TIMEOUT=300
-
-        echo "📜 切换到GitHub镜像源"
-        # 此时site.mk已存在，sed命令可正常执行
-        sed -i 's@OPENWRT_MIRROR:=.*@OPENWRT_MIRROR:=https://github.com/openwrt/releases-mirror/raw/master/@g' ./include/site.mk
-        sed -i 's@https\?://downloads.openwrt.org/@https://github.com/openwrt/releases-mirror/raw/master/@g' ./scripts/download.pl
         
-        echo "🔍 验证下载源配置："
-        grep -n "OPENWRT_MIRROR" ./include/site.mk || echo "⚠️ site.mk无OPENWRT_MIRROR"
-
-        echo -e "\033[34m🔹 第1次尝试：GitHub源下载依赖\033[0m"
-        make download -j4 V=s > download.log 2>&1
-        if [ $? -ne 0 ]; then
-          echo -e "\033[33m⚠️ GitHub源失败，重试第2次\033[0m"
-          make download -j4 V=s > download_2.log 2>&1
-          if [ $? -ne 0 ]; then
-            echo -e "\033[31m❌ GitHub源失败，切换官方源\033[0m"
-            sed -i 's@OPENWRT_MIRROR:=https://github.com/openwrt/releases-mirror/raw/master/@OPENWRT_MIRROR:=https://downloads.openwrt.org/@g' ./include/site.mk
-            sed -i 's@https://github.com/openwrt/releases-mirror/raw/master/@https://downloads.openwrt.org/@g' ./scripts/download.pl
-            make download -j1 V=s
-            if [ $? -ne 0 ]; then
-              echo -e "\033[31m❌ 官方源也失败，终止\033[0m"
-              exit 1
-            fi
-            sed -i 's@OPENWRT_MIRROR:=https://downloads.openwrt.org/@OPENWRT_MIRROR:=https://github.com/openwrt/releases-mirror/raw/master/@g' ./include/site.mk
-          fi
-        fi
-
+        echo "📜 开始下载编译依赖包（使用默认源）"
+        # 多线程下载，失败则单线程重试
+        make download -j$(nproc) V=s || make download -j1 V=s
+        
+        # 清理残缺包
         find dl -size -1024c -exec rm -f {} \;
-        echo -e "\033[32m✅ 依赖包下载完成\033[0m"
-        echo "📊 下载统计："
-        ls -lh ./dl | wc -l
-        du -sh ./dl
-        find ./dl -size 0 -exec echo "❌ 残缺包：{}" \;
+        # 验证下载结果
+        echo "✅ 依赖包下载完成，统计信息："
+        ls -lh dl | wc -l
+        du -sh dl
+        echo "🔍 残缺包检查：$(find dl -size 0 | wc -l) 个"
 
-    - name: 依赖缓存命中提示
-      if: steps.cache-dl.outputs.cache-hit == 'true'
-      run: |
-        echo -e "\033[32m✅ 依赖包缓存命中，跳过下载\033[0m"
-        ls -lh ./openwrt/dl | head -10
-
-    - name: 生成编译任务列表
+    # 开始编译（核心步骤）
+    - name: 编译OpenWRT固件
       run: |
         cd openwrt
-        make -j1 -n > build_tasks.log 2>&1
-        TOTAL_TASKS=$(grep -E '^make\[.*\]: Entering directory|^cc |^gcc |^g\+\+ ' build_tasks.log | wc -l)
-        echo "总编译任务数：$TOTAL_TASKS"
-        echo "TOTAL_TASKS=$TOTAL_TASKS" >> $GITHUB_ENV
-        rm -f build_tasks.log
+        # 编译（多线程失败则单线程）
+        make -j$(nproc) V=s || make -j1 V=s
+        echo "✅ 编译完成"
 
-    - name: 开始编译OpenWRT
-      run: |
-        cd openwrt
-        cat > progress_monitor.sh << 'EOF'
-        #!/bin/bash
-        LOG_FILE="build.log"
-        TOTAL_TASKS=$1
-        CURRENT_TASK=0
-        while [ -f "$LOG_FILE" ]; do
-            CURRENT_TASK=$(grep -E '^cc |^gcc |^g\+\+ ' "$LOG_FILE" | wc -l)
-            if [ $TOTAL_TASKS -gt 0 ]; then
-                PROGRESS=$(echo "scale=2; $CURRENT_TASK / $TOTAL_TASKS * 100" | bc)
-                echo -e "\033[32m📊 编译进度: $CURRENT_TASK/$TOTAL_TASKS ($PROGRESS%)\033[0m"
-            fi
-            sleep 10
-        done
-        EOF
-        chmod +x progress_monitor.sh
-        ./progress_monitor.sh ${{ env.TOTAL_TASKS }} &
-        MONITOR_PID=$!
-
-        echo -e "\033[34m🚀 开始编译OpenWRT 21.02\033[0m"
-        make -j$(nproc) V=s 2>&1 | tee build.log || make -j1 V=s 2>&1 | tee -a build.log
-
-        kill $MONITOR_PID
-        rm -f progress_monitor.sh
-        echo -e "\033[32m✅ 编译完成\033[0m"
-        ls -lh ./bin/targets/
-
-    - name: 复制编译产物到仓库目录
+    # 复制产物
+    - name: 复制编译产物
       run: |
         mkdir -p ./openwrt-firmware
         cp -rf ./openwrt/bin/targets/* ./openwrt-firmware/
-        echo "📁 编译产物列表："
-        ls -lh ./openwrt-firmware/
-        du -sh ./openwrt-firmware/
+        echo "📁 编译产物已复制到 openwrt-firmware 目录"
 
-    - name: 上传编译产物到Artifact
+    # 上传产物到Artifact
+    - name: 上传编译产物
       uses: actions/upload-artifact@v4
       with:
         name: openwrt-21.02-firmware
         path: ./openwrt-firmware/
         retention-days: 7
-
-    - name: 推送编译产物到代码仓库
-      if: success()
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        git config --global user.name "GitHub Actions"
-        git config --global user.email "actions@github.com"
-        git pull origin ${{ github.ref_name }} --rebase || git pull origin ${{ github.ref_name }} --rebase --autostash
-        git add ./openwrt-firmware/
-        git commit -m "Build OpenWRT 21.02 firmware at $(date +'%Y-%m-%d %H:%M:%S')" || echo "无新产物，跳过提交"
-        git push https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD:${{ github.ref_name }} || echo "推送失败（无新内容）"
