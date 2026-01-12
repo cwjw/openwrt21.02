@@ -10,7 +10,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-20.04  # 适配21.02依赖的核心环境
+    runs-on: ubuntu-22.04  # 适配21.02依赖的核心环境
 
     steps:
     - name: 检出代码仓库
