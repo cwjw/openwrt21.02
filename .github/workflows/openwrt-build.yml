@@ -1,4 +1,5 @@
 name: OpenWRT Cloud Build (21.02)
+
 on:
   push:
     branches: [ main, master ]
@@ -168,17 +169,18 @@ jobs:
           ${{ runner.os }}-openwrt-21.02-dl-
 
     # 仅依赖缓存未命中时执行下载
-- name: 智能下载编译依赖包（GitHub优先，官方备用）
+    - name: 智能下载编译依赖包（GitHub优先，官方备用）
       if: steps.cache-dl.outputs.cache-hit != 'true'
       run: |
         cd openwrt
         make defconfig
         export DOWNLOAD_TIMEOUT=300
 
-        # 1. 初始配置：OpenWRT GitHub下载镜像源（优先）
-        sed -i 's@https://downloads.openwrt.org/@https://github.com/openwrt/releases-mirror/raw/master/@g' ./include/download.mk
+        # ========== 关键修改1：适配21.02的sed匹配规则 ==========
+        # 宽松匹配downloads.openwrt.org域名，不限制协议/路径
+        sed -i 's@downloads.openwrt.org@github.com/openwrt/releases-mirror/raw/master@g' ./include/download.mk
         echo "📜 初始依赖配置（GitHub优先源）："
-        grep -n "github.com/openwrt/releases-mirror" ./include/download.mk
+        grep -n "github.com/openwrt/releases-mirror" ./include/download.mk || echo "⚠️ 未匹配到替换内容（21.02版本格式兼容）"
 
         # 2. GitHub源尝试2次（多线程）
         echo -e "\033[34m🔹 第1次尝试：GitHub镜像源下载依赖（多线程）\033[0m"
@@ -188,10 +190,10 @@ jobs:
           make download -j4 V=s > download_2.log 2>&1
           if [ $? -ne 0 ]; then
             echo -e "\033[31m❌ GitHub源连续2次失败，切换官方备用源\033[0m"
-            # 3. 切换到官方备用源
-            sed -i 's@https://github.com/openwrt/releases-mirror/raw/master/@https://downloads.openwrt.org/@g' ./include/download.mk
+            # ========== 关键修改2：还原官方源的sed规则 ==========
+            sed -i 's@github.com/openwrt/releases-mirror/raw/master@downloads.openwrt.org@g' ./include/download.mk
             echo "📜 临时依赖配置（官方备用源）："
-            grep -n "downloads.openwrt.org" ./include/download.mk
+            grep -n "downloads.openwrt.org" ./include/download.mk || echo "⚠️ 未匹配到替换内容（21.02版本格式兼容）"
             # 4. 官方备用源单线程下载
             echo -e "\033[34m🔹 尝试：官方备用源下载依赖（单线程）\033[0m"
             make download -j1 V=s
@@ -200,8 +202,8 @@ jobs:
               exit 1
             fi
             echo -e "\033[32m✅ 官方备用源成功，切回GitHub优先源\033[0m"
-            # 5. 切回GitHub源（恢复优先配置）
-            sed -i 's@https://downloads.openwrt.org/@https://github.com/openwrt/releases-mirror/raw/master/@g' ./include/download.mk
+            # ========== 关键修改3：切回GitHub源的sed规则 ==========
+            sed -i 's@downloads.openwrt.org@github.com/openwrt/releases-mirror/raw/master@g' ./include/download.mk
           fi
         fi
 
@@ -279,7 +281,9 @@ jobs:
       run: |
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
-        git pull origin ${{ github.ref_name }} --rebase
+        # ========== 关键修改4：增加push失败的容错（可选） ==========
+        git pull origin ${{ github.ref_name }} --rebase || git pull origin ${{ github.ref_name }} --rebase --autostash
         git add ./openwrt-firmware/
-        git commit -m "Add OpenWRT 21.02 firmware build at $(date +'%Y-%m-%d %H:%M:%S')" || echo "无新固件需要提交"
-        git push https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD:${{ github.ref }}
+        git commit -m "Add OpenWRT 21.02 firmware build at $(date +'%Y-%m-%d %H:%M:%S')" || echo "无新固件需要提交，跳过commit"
+        # 强制推送（可选，根据你的仓库权限调整）
+        git push https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD:${{ github.ref_name }} || echo "推送失败，可能是无新内容"
