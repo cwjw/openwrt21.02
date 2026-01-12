@@ -1,0 +1,207 @@
+name: OpenWRT Cloud Build (21.02)
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - '.config'
+      - '.github/workflows/openwrt-build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: 检出当前编译仓库（openwrt21.02）
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
+    # 缓存编译环境，避免重复配置
+    - name: 缓存编译环境
+      uses: actions/cache@v3
+      id: cache-env
+      with:
+        path: |
+          /usr/local/bin
+          /usr/local/lib
+          /usr/lib
+          /usr/bin
+        key: ${{ runner.os }}-openwrt-21.02-env-${{ hashFiles('.github/workflows/openwrt-build.yml') }}
+        restore-keys: |
+          ${{ runner.os }}-openwrt-21.02-env-
+
+    # 仅在缓存未命中时配置环境
+    - name: 配置编译环境（仅缓存未命中时执行）
+      if: steps.cache-env.outputs.cache-hit != 'true'
+      env:
+        DEBIAN_FRONTEND: noninteractive
+        APT_LISTCHANGES_FRONTEND: none
+        APT_OPTIONS: '-o Dpkg::Use-Pty=0 -o APT::Color=0 -q'
+      run: |
+        echo "deb http://archive.ubuntu.com/ubuntu/ focal universe" | sudo tee -a /etc/apt/sources.list > /dev/null
+        echo "deb http://archive.ubuntu.com/ubuntu/ focal-updates universe" | sudo tee -a /etc/apt/sources.list > /dev/null
+        
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo apt-get update -y $APT_OPTIONS
+        sudo apt-get full-upgrade -y $APT_OPTIONS
+        sudo apt-get install -y $APT_OPTIONS \
+        build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+        gettext git libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget \
+        libelf-dev ecj fastjar java-propose-classpath bc
+        sudo apt-get autoremove -y $APT_OPTIONS
+        sudo apt-get clean -y $APT_OPTIONS
+
+    # 克隆复刻仓库（增加重试+详细日志+失败终止）
+    - name: 克隆cwjw/OpenWRT源码（增加容错）
+      run: |
+        # 先删除残留的openwrt目录（避免冲突）
+        rm -rf ./openwrt
+        # 克隆仓库，增加-v参数输出详细日志，重试3次
+        echo "开始克隆仓库：https://github.com/cwjw/OpenWRT.git"
+        git clone -v https://github.com/cwjw/OpenWRT.git openwrt || git clone -v https://github.com/cwjw/OpenWRT.git openwrt || git clone -v https://github.com/cwjw/OpenWRT.git openwrt
+        # 校验克隆是否成功
+        if [ ! -d "./openwrt" ]; then
+          echo "❌ 克隆仓库失败，未找到openwrt目录"
+          ls -lh ./  # 列出当前目录文件，方便排查
+          exit 1
+        fi
+        # 进入目录并切换版本
+        cd openwrt
+        echo "当前目录：$(pwd)"
+        # 先查看所有可用分支/标签
+        git tag | grep v21.02
+        git checkout v21.02.7 || { echo "❌ 切换v21.02.7版本失败"; exit 1; }
+        echo "当前OpenWRT版本：$(git describe --tags)"
+
+    # 增加目录校验，避免cd失败
+    - name: 校验openwrt目录并复制.config
+      run: |
+        # 先校验目录是否存在
+        if [ ! -d "./openwrt" ]; then
+          echo "❌ openwrt目录不存在，终止编译"
+          ls -lh ./  # 列出当前目录，方便排查
+          exit 1
+        fi
+        # 复制.config文件
+        cp -f ./.config ./openwrt/.config
+        if [ -f ./openwrt/.config ]; then
+          echo "✅ .config 文件已成功复制"
+          cat ./openwrt/.config | head -10
+        else
+          echo "❌ 未找到.config文件，编译终止"
+          exit 1
+        fi
+
+    # 更新feeds并安装（增加重试）
+    - name: 更新feeds并安装（增加重试）
+      run: |
+        # 再次校验目录
+        if [ ! -d "./openwrt" ]; then
+          echo "❌ openwrt目录不存在，终止操作"
+          exit 1
+        fi
+        cd openwrt
+        ./scripts/feeds update -a || ./scripts/feeds update -a || ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    # 缓存编译依赖包
+    - name: 缓存编译依赖包
+      uses: actions/cache@v3
+      with:
+        path: ./openwrt/dl
+        key: ${{ runner.os }}-openwrt-21.02-dl-${{ hashFiles('./openwrt/.config') }}
+        restore-keys: |
+          ${{ runner.os }}-openwrt-21.02-dl-
+
+    - name: 下载编译依赖包（改为-j8并发）
+      run: |
+        if [ ! -d "./openwrt" ]; then
+          echo "❌ openwrt目录不存在，终止操作"
+          exit 1
+        fi
+        cd openwrt
+        make defconfig
+        make download -j8 V=s || make download -j8 V=s
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: 生成编译任务列表（用于进度计算）
+      run: |
+        if [ ! -d "./openwrt" ]; then
+          echo "❌ openwrt目录不存在，终止操作"
+          exit 1
+        fi
+        cd openwrt
+        make -j1 -n > build_tasks.log 2>&1
+        TOTAL_TASKS=$(grep -E '^make\[.*\]: Entering directory|^cc |^gcc |^g\+\+ ' build_tasks.log | wc -l)
+        echo "总编译任务数: $TOTAL_TASKS"
+        echo "TOTAL_TASKS=$TOTAL_TASKS" >> $GITHUB_ENV
+        rm -f build_tasks.log
+
+    - name: 开始编译（带实时进度+改为-j7固定并发）
+      run: |
+        if [ ! -d "./openwrt" ]; then
+          echo "❌ openwrt目录不存在，终止操作"
+          exit 1
+        fi
+        cd openwrt
+        cat > progress_monitor.sh << 'EOF'
+        #!/bin/bash
+        LOG_FILE="build.log"
+        TOTAL_TASKS=$1
+        CURRENT_TASK=0
+        
+        while [ -f "$LOG_FILE" ]; do
+            CURRENT_TASK=$(grep -E '^cc |^gcc |^g\+\+ ' "$LOG_FILE" | wc -l)
+            if [ $TOTAL_TASKS -gt 0 ]; then
+                PROGRESS=$(echo "scale=2; $CURRENT_TASK / $TOTAL_TASKS * 100" | bc)
+                echo -e "\033[32m📊 编译进度: $CURRENT_TASK/$TOTAL_TASKS ($PROGRESS%)\033[0m"
+            fi
+            sleep 10
+        done
+        EOF
+        
+        chmod +x progress_monitor.sh
+        ./progress_monitor.sh $TOTAL_TASKS &
+        MONITOR_PID=$!
+        
+        echo -e "\033[34m🚀 开始编译OpenWRT 21.02，总任务数: $TOTAL_TASKS\033[0m"
+        make -j7 V=s 2>&1 | tee build.log || make -j1 V=s 2>&1 | tee -a build.log
+        
+        kill $MONITOR_PID
+        rm -f progress_monitor.sh
+        echo -e "\033[32m✅ 编译完成！最终进度: 100%\033[0m"
+        ls -lh ./bin/targets/
+
+    - name: 复制编译产物到当前仓库（openwrt21.02）根目录
+      run: |
+        if [ ! -d "./openwrt" ]; then
+          echo "❌ openwrt目录不存在，终止操作"
+          exit 1
+        fi
+        mkdir -p ./openwrt-firmware
+        cp -rf ./openwrt/bin/targets/* ./openwrt-firmware/
+        echo "📁 根目录固件文件列表："
+        ls -lh ./openwrt-firmware/
+        du -sh ./openwrt-firmware/
+
+    - name: 上传编译产物（备份）
+      uses: actions/upload-artifact@v4
+      with:
+        name: openwrt-firmware-21.02
+        path: ./openwrt-firmware/
+        retention-days: 7
+
+    - name: 推送固件到当前仓库（openwrt21.02）根目录
+      if: success()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        git pull origin ${{ github.ref_name }} --rebase
+        git add ./openwrt-firmware/
+        git commit -m "Add OpenWRT 21.02 firmware build at $(date +'%Y-%m-%d %H:%M:%S')" || echo "无新固件需要提交"
+        git push https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD:${{ github.ref }}
