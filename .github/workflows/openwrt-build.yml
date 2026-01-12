@@ -1,58 +1,82 @@
-name: OpenWRT 21.02 云编译（MT7620A+4G+WireGuard+中文）
+name: OpenWRT Cloud Build
+
+# 触发条件：推送代码、手动触发、定时触发（可选）
 on:
-  workflow_dispatch:  # 手动触发编译
+  push:
+    branches: [ main, master ]
+    paths:
+      - '.config'       # 只有.config文件变动时触发
+      - '.github/workflows/openwrt-build.yml' # 工作流文件变动时触发
+  workflow_dispatch:    # 允许手动触发编译
 
 jobs:
   build:
-    runs-on: ubuntu-20.04  # 兼容OpenWRT 21.02编译环境
+    runs-on: ubuntu-22.04  # 使用稳定的Ubuntu 22.04环境
+
     steps:
-      - name: 检查代码
-        uses: actions/checkout@v3
+    - name: 检出代码仓库
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+        # 确保完整检出仓库，包括根目录的.config文件
 
-      - name: 安装编译依赖
-        run: |
-          sudo apt update
-          sudo apt install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget
+    - name: 配置编译环境
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo apt update -y
+        sudo apt full-upgrade -y
+        sudo apt install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+        gettext git libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget
+        sudo apt autoremove -y
+        sudo apt clean -y
 
-      - name: 克隆OpenWRT 21.02官方源码
-        run: |
-          git clone -b openwrt-21.02 https://github.com/openwrt/openwrt.git openwrt
-          cd openwrt
-          # 更新feeds
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+    - name: 克隆OpenWRT源码（以官方源码为例，可替换为你需要的仓库）
+      run: |
+        git clone https://git.openwrt.org/openwrt/openwrt.git openwrt
+        cd openwrt
+        # 切换到指定版本（可选，根据需要调整）
+        git checkout v23.05.3
 
-      - name: 集成lean插件（兼容21.02版本）
-        run: |
-          cd openwrt
-          mkdir -p package/lean
-          # 下载lean插件并清理不兼容文件
-          wget https://codeload.github.com/coolsnowwolf/lede/zip/refs/heads/master -O lede-master.zip
-          unzip -q lede-master.zip "lede-master/package/lean/*" -d tmp
-          mv tmp/lede-master/package/lean/* package/lean/
-          rm -rf tmp lede-master.zip
-          # 删除不兼容插件，避免编译报错
-          rm -rf package/lean/{optee-os-stm32,bpf-headers,pcat-manager,openssl,qosify,bridger,unetd,dpdk,apk,dtc}
-          rm -rf package/lean/target/linux/
+    - name: 复制仓库根目录的.config到OpenWRT源码目录
+      run: |
+        # 核心步骤：将仓库根目录的.config复制到openwrt源码目录
+        cp -f ./.config ./openwrt/.config
+        # 验证配置文件是否复制成功
+        if [ -f ./openwrt/.config ]; then
+          echo "✅ .config 文件已成功复制到OpenWRT源码目录"
+          cat ./openwrt/.config | head -10 # 打印前10行验证
+        else
+          echo "❌ 未找到.config文件，编译终止"
+          exit 1
+        fi
 
-      - name: 上传自定义.config配置文件
-        run: |
-          # 将本地的.config（提前配置好的）复制到openwrt目录
-          cp .config openwrt/.config
-        # 注意：如果.config在仓库根目录，需先上传到GitHub仓库
+    - name: 更新feeds并安装
+      run: |
+        cd openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
 
-      - name: 下载编译依赖包
-        run: |
-          cd openwrt
-          make download -j8
+    - name: 下载编译依赖包
+      run: |
+        cd openwrt
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
 
-      - name: 开始编译固件
-        run: |
-          cd openwrt
-          make -j$(nproc) V=s
+    - name: 开始编译
+      run: |
+        cd openwrt
+        # 根据CPU核心数调整-j后的数值，避免编译卡死
+        make -j$(nproc) || make -j1 V=s
+        # 检查编译产物是否生成
+        ls -lh ./bin/targets/
 
-      - name: 上传编译产物
-        uses: actions/upload-artifact@v3
-        with:
-          name: openwrt-21.02-mt7620a-firmware
-          path: openwrt/bin/targets/ramips/mt7620/*.bin
+    - name: 上传编译产物
+      uses: actions/upload-artifact@v4
+      with:
+        name: openwrt-firmware
+        path: openwrt/bin/targets/
+        retention-days: 7 # 产物保留7天
