@@ -1,3 +1,174 @@
+name: OpenWRT Cloud Build (21.02)
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - '.config'
+      - '.github/workflows/openwrt-build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: 检出当前编译仓库（openwrt21.02）
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
+    # 优化系统网络配置（适配GitHub源优先）
+    - name: 优化网络配置
+      run: |
+        # 配置curl超时和重试（适配GitHub源特性）
+        echo "max-time = 300" >> ~/.curlrc
+        echo "retry = 2" >> ~/.curlrc
+        echo "retry-delay = 10" >> ~/.curlrc
+        # 配置git超时（GitHub源专用）
+        git config --global http.timeout 300
+        git config --global https.timeout 300
+        git config --global http.retry 2
+
+    - name: 缓存编译环境
+      uses: actions/cache@v3
+      id: cache-env
+      with:
+        path: |
+          /usr/local/bin
+          /usr/local/lib
+          /usr/lib
+          /usr/bin
+        key: ${{ runner.os }}-openwrt-21.02-env-${{ hashFiles('.github/workflows/openwrt-build.yml') }}
+        restore-keys: |
+          ${{ runner.os }}-openwrt-21.02-env-
+
+    - name: 配置编译环境（仅缓存未命中时执行）
+      if: steps.cache-env.outputs.cache-hit != 'true'
+      env:
+        DEBIAN_FRONTEND: noninteractive
+        APT_LISTCHANGES_FRONTEND: none
+        APT_OPTIONS: '-o Dpkg::Use-Pty=0 -o APT::Color=0 -q'
+      run: |
+        echo "deb http://archive.ubuntu.com/ubuntu/ focal universe" | sudo tee -a /etc/apt/sources.list > /dev/null
+        echo "deb http://archive.ubuntu.com/ubuntu/ focal-updates universe" | sudo tee -a /etc/apt/sources.list > /dev/null
+        
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo apt-get update -y $APT_OPTIONS
+        sudo apt-get full-upgrade -y $APT_OPTIONS
+        sudo apt-get install -y $APT_OPTIONS \
+        build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+        gettext git libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget \
+        libelf-dev ecj fastjar java-propose-classpath bc
+        sudo apt-get autoremove -y $APT_OPTIONS
+        sudo apt-get clean -y $APT_OPTIONS
+
+    - name: 克隆cwjw/OpenWRT源码并切换版本
+      run: |
+        rm -rf ./openwrt
+        git clone -v https://github.com/cwjw/OpenWRT.git openwrt
+        if [ ! -d "./openwrt" ]; then
+          echo "❌ 克隆仓库失败"
+          ls -lh ./
+          exit 1
+        fi
+        cd openwrt
+        git tag
+        git checkout v21.02.7
+        echo "✅ 成功切换到版本：$(git describe --tags)"
+
+    - name: 复制.config到OpenWRT源码目录
+      run: |
+        cp -f ./.config ./openwrt/.config
+        if [ -f ./openwrt/.config ]; then
+          echo "✅ .config 文件已成功复制"
+          head -10 ./openwrt/.config
+        else
+          echo "❌ 未找到.config文件，编译终止"
+          exit 1
+        fi
+
+    # 新增：缓存feeds相关内容（核心）
+    - name: 缓存feeds内容
+      id: cache-feeds
+      uses: actions/cache@v3
+      with:
+        path: |
+          ./openwrt/feeds
+          ./openwrt/staging_dir/feeds
+          ./openwrt/package/feeds
+        key: ${{ runner.os }}-openwrt-21.02-feeds-${{ hashFiles('./openwrt/.config', './openwrt/feeds.conf.default') }}
+        restore-keys: |
+          ${{ runner.os }}-openwrt-21.02-feeds-
+
+    # 优化：仅feeds缓存未命中时，才执行智能更新feeds
+    - name: 智能更新feeds（GitHub优先，官方备用）
+      if: steps.cache-feeds.outputs.cache-hit != 'true'
+      run: |
+        cd openwrt
+        # 1. 初始配置：GitHub镜像源（优先）
+        > feeds.conf.default
+        echo "src-git packages https://github.com/openwrt/packages.git;openwrt-21.02" >> feeds.conf.default
+        echo "src-git luci https://github.com/openwrt/luci.git;openwrt-21.02" >> feeds.conf.default
+        echo "src-git routing https://github.com/openwrt/routing.git;openwrt-21.02" >> feeds.conf.default
+        echo "src-git telephony https://github.com/openwrt/telephony.git;openwrt-21.02" >> feeds.conf.default
+        echo "📜 初始feeds配置（GitHub优先源）："
+        cat feeds.conf.default
+
+        # 2. GitHub源尝试2次（优先源）
+        echo -e "\033[34m🔹 第1次尝试：GitHub源更新feeds\033[0m"
+        ./scripts/feeds update -a > feeds_update.log 2>&1
+        if [ $? -ne 0 ]; then
+          echo -e "\033[33m⚠️  GitHub源第1次失败，重试第2次\033[0m"
+          ./scripts/feeds update -a > feeds_update_2.log 2>&1
+          if [ $? -ne 0 ]; then
+            echo -e "\033[31m❌ GitHub源连续2次失败，切换官方备用源\033[0m"
+            # 3. 切换到官方备用源
+            > feeds.conf.default
+            echo "src-git packages https://git.openwrt.org/feed/packages.git^48242ee7a190db7740f7b9b3ef1debfa4d5857f6" >> feeds.conf.default
+            echo "src-git luci https://git.openwrt.org/project/luci.git^e98243ef9eb838cca80cdd6d1bd0cf69a509d103" >> feeds.conf.default
+            echo "src-git routing https://git.openwrt.org/feed/routing.git^8071852b4556a02533cacb7a0f6a432df3507302" >> feeds.conf.default
+            echo "src-git telephony https://git.openwrt.org/feed/telephony.git^920fbc5c0a2e4badf51bceff42e9a1e3eb693462" >> feeds.conf.default
+            echo "📜 临时feeds配置（官方备用源）："
+            cat feeds.conf.default
+            # 4. 官方备用源更新
+            ./scripts/feeds update -a
+            if [ $? -ne 0 ]; then
+              echo -e "\033[31m❌ 官方备用源也失败，终止流程\033[0m"
+              exit 1
+            fi
+            echo -e "\033[32m✅ 官方备用源成功，切回GitHub优先源\033[0m"
+            # 5. 切回GitHub源（恢复优先配置）
+            > feeds.conf.default
+            echo "src-git packages https://github.com/openwrt/packages.git;openwrt-21.02" >> feeds.conf.default
+            echo "src-git luci https://github.com/openwrt/luci.git;openwrt-21.02" >> feeds.conf.default
+            echo "src-git routing https://github.com/openwrt/routing.git;openwrt-21.02" >> feeds.conf.default
+            echo "src-git telephony https://github.com/openwrt/telephony.git;openwrt-21.02" >> feeds.conf.default
+          fi
+        fi
+
+        # 6. 安装feeds（最终用GitHub优先源）
+        ./scripts/feeds install -a
+        echo -e "\033[32m✅ feeds更新&安装完成\033[0m"
+
+    # 新增：feeds缓存命中提示
+    - name: feeds缓存命中提示
+      if: steps.cache-feeds.outputs.cache-hit == 'true'
+      run: |
+        echo -e "\033[32m✅ feeds缓存命中，跳过feeds update/install步骤\033[0m"
+        ls -lh ./openwrt/feeds  # 可选：列出缓存的feeds目录，确认完整性
+
+    # 缓存编译依赖包
+    - name: 缓存编译依赖包
+      id: cache-dl
+      uses: actions/cache@v3
+      with:
+        path: ./openwrt/dl
+        key: ${{ runner.os }}-openwrt-21.02-dl-${{ hashFiles('./openwrt/.config') }}
+        restore-keys: |
+          ${{ runner.os }}-openwrt-21.02-dl-
+
+    # 仅依赖缓存未命中时执行下载
 - name: 智能下载编译依赖包（GitHub优先，官方备用）
   if: steps.cache-dl.outputs.cache-hit != 'true'
   run: |
@@ -40,3 +211,77 @@
     find dl -size -1024c -exec ls -l {} \;
     find dl -size -1024c -exec rm -f {} \;
     echo -e "\033[32m✅ 依赖包下载完成\033[0m"
+
+    # 依赖缓存命中提示
+    - name: 依赖缓存命中提示
+      if: steps.cache-dl.outputs.cache-hit == 'true'
+      run: |
+        echo -e "\033[32m✅ 依赖包缓存命中，跳过下载步骤\033[0m"
+        ls -lh ./openwrt/dl
+
+    - name: 生成编译任务列表
+      run: |
+        cd openwrt
+        make -j1 -n > build_tasks.log 2>&1
+        TOTAL_TASKS=$(grep -E '^make\[.*\]: Entering directory|^cc |^gcc |^g\+\+ ' build_tasks.log | wc -l)
+        echo "总编译任务数: $TOTAL_TASKS"
+        echo "TOTAL_TASKS=$TOTAL_TASKS" >> $GITHUB_ENV
+        rm -f build_tasks.log
+
+    - name: 开始编译（带实时进度）
+      run: |
+        cd openwrt
+        cat > progress_monitor.sh << 'EOF'
+        #!/bin/bash
+        LOG_FILE="build.log"
+        TOTAL_TASKS=$1
+        CURRENT_TASK=0
+        
+        while [ -f "$LOG_FILE" ]; do
+            CURRENT_TASK=$(grep -E '^cc |^gcc |^g\+\+ ' "$LOG_FILE" | wc -l)
+            if [ $TOTAL_TASKS -gt 0 ]; then
+                PROGRESS=$(echo "scale=2; $CURRENT_TASK / $TOTAL_TASKS * 100" | bc)
+                echo -e "\033[32m📊 编译进度: $CURRENT_TASK/$TOTAL_TASKS ($PROGRESS%)\033[0m"
+            fi
+            sleep 10
+        done
+        EOF
+        
+        chmod +x progress_monitor.sh
+        ./progress_monitor.sh $TOTAL_TASKS &
+        MONITOR_PID=$!
+        
+        echo -e "\033[34m🚀 开始编译OpenWRT 21.02\033[0m"
+        make -j7 V=s 2>&1 | tee build.log || make -j1 V=s 2>&1 | tee -a build.log
+        
+        kill $MONITOR_PID
+        rm -f progress_monitor.sh
+        echo -e "\033[32m✅ 编译完成\033[0m"
+        ls -lh ./bin/targets/
+
+    - name: 复制编译产物到仓库根目录
+      run: |
+        mkdir -p ./openwrt-firmware
+        cp -rf ./openwrt/bin/targets/* ./openwrt-firmware/
+        echo "📁 固件文件列表："
+        ls -lh ./openwrt-firmware/
+        du -sh ./openwrt-firmware/
+
+    - name: 上传编译产物（备份）
+      uses: actions/upload-artifact@v4
+      with:
+        name: openwrt-firmware-21.02
+        path: ./openwrt-firmware/
+        retention-days: 7
+
+    - name: 推送固件到仓库根目录
+      if: success()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        git pull origin ${{ github.ref_name }} --rebase
+        git add ./openwrt-firmware/
+        git commit -m "Add OpenWRT 21.02 firmware build at $(date +'%Y-%m-%d %H:%M:%S')" || echo "无新固件需要提交"
+        git push https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD:${{ github.ref }}
