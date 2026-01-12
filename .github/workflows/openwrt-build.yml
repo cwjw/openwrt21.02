@@ -1,5 +1,4 @@
 name: OpenWRT Cloud Build (21.02)
-
 on:
   push:
     branches: [ main, master ]
