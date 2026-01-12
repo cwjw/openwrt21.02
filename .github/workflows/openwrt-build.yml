@@ -51,24 +51,17 @@ jobs:
         sudo apt-get autoremove -y $APT_OPTIONS
         sudo apt-get clean -y $APT_OPTIONS
 
-    # 核心修复：克隆仓库+确认标签+切换版本（标签已存在）
     - name: 克隆cwjw/OpenWRT源码并切换版本
       run: |
-        # 删除残留目录，避免冲突
         rm -rf ./openwrt
-        # 克隆你的复刻仓库（带详细日志）
         git clone -v https://github.com/cwjw/OpenWRT.git openwrt
-        # 强制校验目录是否存在
         if [ ! -d "./openwrt" ]; then
-          echo "❌ 克隆仓库失败，当前目录文件："
+          echo "❌ 克隆仓库失败"
           ls -lh ./
           exit 1
         fi
-        # 进入目录并切换版本
         cd openwrt
-        echo "📜 仓库所有标签："
         git tag
-        # 切换到v21.02.7（已确认标签存在）
         git checkout v21.02.7
         echo "✅ 成功切换到版本：$(git describe --tags)"
 
@@ -83,10 +76,27 @@ jobs:
           exit 1
         fi
 
-    - name: 更新feeds并安装（增加重试）
+    # 终极修复：完全重写feeds.conf.default，只保留GitHub镜像源
+    - name: 重写feeds配置（替换为GitHub镜像）
       run: |
         cd openwrt
-        ./scripts/feeds update -a || ./scripts/feeds update -a || ./scripts/feeds update -a
+        # 1. 完全清空原有feeds配置文件（关键！）
+        > feeds.conf.default
+        # 2. 重新写入GitHub镜像源（适配21.02版本）
+        echo "src-git packages https://github.com/openwrt/packages.git;openwrt-21.02" >> feeds.conf.default
+        echo "src-git luci https://github.com/openwrt/luci.git;openwrt-21.02" >> feeds.conf.default
+        echo "src-git routing https://github.com/openwrt/routing.git;openwrt-21.02" >> feeds.conf.default
+        echo "src-git telephony https://github.com/openwrt/telephony.git;openwrt-21.02" >> feeds.conf.default
+        # 3. 验证配置文件内容
+        echo "📜 新的feeds配置："
+        cat feeds.conf.default
+
+    # 重试更新feeds（此时已无官方源）
+    - name: 更新feeds并安装（仅用GitHub镜像）
+      run: |
+        cd openwrt
+        # 4次重试，确保拉取成功
+        ./scripts/feeds update -a || ./scripts/feeds update -a || ./scripts/feeds update -a || ./scripts/feeds update -a
         ./scripts/feeds install -a
 
     - name: 缓存编译依赖包
@@ -102,7 +112,6 @@ jobs:
         cd openwrt
         make defconfig
         make download -j8 V=s || make download -j8 V=s
-        # 清理无效依赖包
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
 
@@ -118,7 +127,6 @@ jobs:
     - name: 开始编译（带实时进度）
       run: |
         cd openwrt
-        # 进度监控脚本
         cat > progress_monitor.sh << 'EOF'
         #!/bin/bash
         LOG_FILE="build.log"
@@ -140,10 +148,8 @@ jobs:
         MONITOR_PID=$!
         
         echo -e "\033[34m🚀 开始编译OpenWRT 21.02\033[0m"
-        # 核心编译，失败后降级为单线程
         make -j7 V=s 2>&1 | tee build.log || make -j1 V=s 2>&1 | tee -a build.log
         
-        # 停止进度监控
         kill $MONITOR_PID
         rm -f progress_monitor.sh
         echo -e "\033[32m✅ 编译完成\033[0m"
