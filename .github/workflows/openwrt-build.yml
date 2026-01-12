@@ -10,7 +10,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-20.04  # 改用20.04，更兼容21.02依赖
+    runs-on: ubuntu-20.04  # 适配21.02依赖的核心环境
 
     steps:
     - name: 检出代码仓库
@@ -24,7 +24,7 @@ jobs:
         APT_LISTCHANGES_FRONTEND: none
         APT_OPTIONS: '-o Dpkg::Use-Pty=0 -o APT::Color=0 -q'
       run: |
-        # 正确写法：用tee + sudo 提权写入源文件，> /dev/null 屏蔽多余输出
+        # 正确提权写入源文件
         echo "deb http://archive.ubuntu.com/ubuntu/ focal universe" | sudo tee -a /etc/apt/sources.list > /dev/null
         echo "deb http://archive.ubuntu.com/ubuntu/ focal-updates universe" | sudo tee -a /etc/apt/sources.list > /dev/null
         
@@ -59,18 +59,17 @@ jobs:
     - name: 更新feeds并安装（增加重试+国内镜像）
       run: |
         cd openwrt
-        # 替换feeds源为清华镜像，解决下载慢/失败问题
+        # 替换feeds源为清华镜像，提升下载速度
         sed -i 's#git.openwrt.org#mirrors.tuna.tsinghua.edu.cn/openwrt#' feeds.conf.default
-        # 增加重试机制
         ./scripts/feeds update -a || ./scripts/feeds update -a || ./scripts/feeds update -a
         ./scripts/feeds install -a
 
-    - name: 下载编译依赖包（降低并发）
+    - name: 下载编译依赖包（改为-j8并发）
       run: |
         cd openwrt
         make defconfig
-        # 单线程下载，避免网络问题
-        make download -j1 V=s || make download -j1 V=s
+        # 核心修改1：将-j1改为-j8，提升下载并发
+        make download -j8 V=s || make download -j8 V=s
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
 
@@ -83,7 +82,7 @@ jobs:
         echo "TOTAL_TASKS=$TOTAL_TASKS" >> $GITHUB_ENV
         rm -f build_tasks.log
 
-    - name: 开始编译（带实时进度+低并发）
+    - name: 开始编译（带实时进度+改为-j7固定并发）
       run: |
         cd openwrt
         cat > progress_monitor.sh << 'EOF'
@@ -107,8 +106,8 @@ jobs:
         MONITOR_PID=$!
         
         echo -e "\033[34m🚀 开始编译OpenWRT 21.02，总任务数: $TOTAL_TASKS\033[0m"
-        # 低并发编译，避免资源超限
-        make -j2 V=s 2>&1 | tee build.log || make -j1 V=s 2>&1 | tee -a build.log
+        # 核心修改2：将-j$(nproc)改为-j7固定并发，保留容错逻辑
+        make -j7 V=s 2>&1 | tee build.log || make -j1 V=s 2>&1 | tee -a build.log
         
         kill $MONITOR_PID
         rm -f progress_monitor.sh
@@ -137,7 +136,6 @@ jobs:
       run: |
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
-        # 指定分支拉取，避免歧义
         git pull origin ${{ github.ref_name }} --rebase
         git add ./openwrt-firmware/
         git commit -m "Add OpenWRT 21.02 firmware build at $(date +'%Y-%m-%d %H:%M:%S')" || echo "无新固件需要提交"
