@@ -18,6 +18,18 @@ jobs:
       with:
         fetch-depth: 1
 
+    # 优化系统网络配置
+    - name: 优化网络配置
+      run: |
+        # 配置curl超时和重试
+        echo "max-time = 300" >> ~/.curlrc
+        echo "retry = 2" >> ~/.curlrc
+        echo "retry-delay = 5" >> ~/.curlrc
+        # 配置git超时
+        git config --global http.timeout 300
+        git config --global https.timeout 300
+        git config --global http.retry 2
+
     - name: 缓存编译环境
       uses: actions/cache@v3
       id: cache-env
@@ -70,34 +82,72 @@ jobs:
         cp -f ./.config ./openwrt/.config
         if [ -f ./openwrt/.config ]; then
           echo "✅ .config 文件已成功复制"
-          cat ./openwrt/.config | head -10
+          head -10 ./openwrt/.config
         else
           echo "❌ 未找到.config文件，编译终止"
           exit 1
         fi
 
-    # 终极修复：完全重写feeds.conf.default，只保留GitHub镜像源
-    - name: 重写feeds配置（替换为GitHub镜像）
+    # 核心：智能源切换逻辑（优先GitHub，超时2次切官方，成功切回）
+    - name: 智能更新feeds（GitHub源→官方源→切回GitHub）
       run: |
         cd openwrt
-        # 1. 完全清空原有feeds配置文件（关键！）
+        # 1. 初始配置：清空并写入GitHub镜像源（默认）
         > feeds.conf.default
-        # 2. 重新写入GitHub镜像源（适配21.02版本）
         echo "src-git packages https://github.com/openwrt/packages.git;openwrt-21.02" >> feeds.conf.default
         echo "src-git luci https://github.com/openwrt/luci.git;openwrt-21.02" >> feeds.conf.default
         echo "src-git routing https://github.com/openwrt/routing.git;openwrt-21.02" >> feeds.conf.default
         echo "src-git telephony https://github.com/openwrt/telephony.git;openwrt-21.02" >> feeds.conf.default
-        # 3. 验证配置文件内容
-        echo "📜 新的feeds配置："
+        echo "📜 初始feeds配置（GitHub源）："
         cat feeds.conf.default
 
-    # 重试更新feeds（此时已无官方源）
-    - name: 更新feeds并安装（仅用GitHub镜像）
+        # 2. 尝试GitHub源更新feeds（最多2次）
+        echo -e "\033[34m🔹 第1次尝试：GitHub源更新feeds\033[0m"
+        ./scripts/feeds update -a > feeds_update.log 2>&1
+        if [ $? -ne 0 ]; then
+          echo -e "\033[33m⚠️  GitHub源第1次更新失败，重试第2次\033[0m"
+          ./scripts/feeds update -a > feeds_update_2.log 2>&1
+          if [ $? -ne 0 ]; then
+            echo -e "\033[31m❌ GitHub源连续2次更新失败，切换到OpenWRT官方源\033[0m"
+            # 3. 切换到OpenWRT官方源
+            > feeds.conf.default
+            echo "src-git packages https://git.openwrt.org/feed/packages.git^48242ee7a190db7740f7b9b3ef1debfa4d5857f6" >> feeds.conf.default
+            echo "src-git luci https://git.openwrt.org/project/luci.git^e98243ef9eb838cca80cdd6d1bd0cf69a509d103" >> feeds.conf.default
+            echo "src-git routing https://git.openwrt.org/feed/routing.git^8071852b4556a02533cacb7a0f6a432df3507302" >> feeds.conf.default
+            echo "src-git telephony https://git.openwrt.org/feed/telephony.git^920fbc5c0a2e4badf51bceff42e9a1e3eb693462" >> feeds.conf.default
+            echo "📜 临时feeds配置（官方源）："
+            cat feeds.conf.default
+            # 4. 官方源尝试更新
+            echo -e "\033[34m🔹 尝试：OpenWRT官方源更新feeds\033[0m"
+            ./scripts/feeds update -a
+            if [ $? -ne 0 ]; then
+              echo -e "\033[31m❌ 官方源更新也失败，终止流程\033[0m"
+              exit 1
+            fi
+            echo -e "\033[32m✅ 官方源更新成功，切回GitHub源\033[0m"
+            # 5. 切回GitHub源（保证后续编译环境一致）
+            > feeds.conf.default
+            echo "src-git packages https://github.com/openwrt/packages.git;openwrt-21.02" >> feeds.conf.default
+            echo "src-git luci https://github.com/openwrt/luci.git;openwrt-21.02" >> feeds.conf.default
+            echo "src-git routing https://github.com/openwrt/routing.git;openwrt-21.02" >> feeds.conf.default
+            echo "src-git telephony https://github.com/openwrt/telephony.git;openwrt-21.02" >> feeds.conf.default
+          fi
+        fi
+
+        # 6. 安装feeds（无论用哪个源更新，最终用GitHub源配置安装）
+        echo -e "\033[34m🔹 安装feeds（GitHub源配置）\033[0m"
+        ./scripts/feeds install -a
+        echo -e "\033[32m✅ feeds更新&安装完成\033[0m"
+
+    # 替换下载源为清华镜像（解决依赖下载超时）
+    - name: 替换依赖下载源为清华镜像
       run: |
         cd openwrt
-        # 4次重试，确保拉取成功
-        ./scripts/feeds update -a || ./scripts/feeds update -a || ./scripts/feeds update -a || ./scripts/feeds update -a
-        ./scripts/feeds install -a
+        # 修改dl源为清华镜像（优先）
+        sed -i 's@https://downloads.openwrt.org/@https://mirrors.tuna.tsinghua.edu.cn/openwrt/@g' ./include/download.mk
+        sed -i 's@http://downloads.openwrt.org/@https://mirrors.tuna.tsinghua.edu.cn/openwrt/@g' ./include/download.mk
+        # 验证源替换
+        grep -n "mirrors.tuna.tsinghua.edu.cn" ./include/download.mk
 
     - name: 缓存编译依赖包
       uses: actions/cache@v3
@@ -107,13 +157,37 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-openwrt-21.02-dl-
 
+    # 下载依赖包（增强超时重试）
     - name: 下载编译依赖包
       run: |
         cd openwrt
         make defconfig
-        make download -j8 V=s || make download -j8 V=s
+        # 依赖下载：优先清华镜像，超时则切官方源
+        export DOWNLOAD_TIMEOUT=300
+        echo -e "\033[34m🔹 第1次尝试：清华镜像源下载依赖\033[0m"
+        make download -j8 V=s > download.log 2>&1
+        if [ $? -ne 0 ]; then
+          echo -e "\033[33m⚠️  清华源下载失败，重试第2次\033[0m"
+          make download -j8 V=s > download_2.log 2>&1
+          if [ $? -ne 0 ]; then
+            echo -e "\033[31m❌ 清华源连续2次失败，切换到OpenWRT官方下载源\033[0m"
+            # 切回官方下载源
+            sed -i 's@https://mirrors.tuna.tsinghua.edu.cn/openwrt/@https://downloads.openwrt.org/@g' ./include/download.mk
+            # 官方源单线程下载
+            make download -j1 V=s
+            if [ $? -ne 0 ]; then
+              echo -e "\033[31m❌ 官方源下载也失败，终止流程\033[0m"
+              exit 1
+            fi
+            echo -e "\033[32m✅ 官方源下载成功，切回清华源\033[0m"
+            # 切回清华源
+            sed -i 's@https://downloads.openwrt.org/@https://mirrors.tuna.tsinghua.edu.cn/openwrt/@g' ./include/download.mk
+          fi
+        fi
+        # 清理无效依赖包
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
+        echo -e "\033[32m✅ 依赖包下载完成\033[0m"
 
     - name: 生成编译任务列表
       run: |
