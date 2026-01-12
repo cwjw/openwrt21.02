@@ -88,8 +88,22 @@ jobs:
           exit 1
         fi
 
-    # Feeds源：GitHub优先，官方源为备用
+    # 新增：缓存feeds相关内容（核心）
+    - name: 缓存feeds内容
+      id: cache-feeds
+      uses: actions/cache@v3
+      with:
+        path: |
+          ./openwrt/feeds
+          ./openwrt/staging_dir/feeds
+          ./openwrt/package/feeds
+        key: ${{ runner.os }}-openwrt-21.02-feeds-${{ hashFiles('./openwrt/.config', './openwrt/feeds.conf.default') }}
+        restore-keys: |
+          ${{ runner.os }}-openwrt-21.02-feeds-
+
+    # 优化：仅feeds缓存未命中时，才执行智能更新feeds
     - name: 智能更新feeds（GitHub优先，官方备用）
+      if: steps.cache-feeds.outputs.cache-hit != 'true'
       run: |
         cd openwrt
         # 1. 初始配置：GitHub镜像源（优先）
@@ -137,7 +151,16 @@ jobs:
         ./scripts/feeds install -a
         echo -e "\033[32m✅ feeds更新&安装完成\033[0m"
 
+    # 新增：feeds缓存命中提示
+    - name: feeds缓存命中提示
+      if: steps.cache-feeds.outputs.cache-hit == 'true'
+      run: |
+        echo -e "\033[32m✅ feeds缓存命中，跳过feeds update/install步骤\033[0m"
+        ls -lh ./openwrt/feeds  # 可选：列出缓存的feeds目录，确认完整性
+
+    # 缓存编译依赖包
     - name: 缓存编译依赖包
+      id: cache-dl
       uses: actions/cache@v3
       with:
         path: ./openwrt/dl
@@ -145,8 +168,9 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-openwrt-21.02-dl-
 
-    # 依赖下载源：GitHub镜像优先，官方源为备用
+    # 仅依赖缓存未命中时执行下载
     - name: 智能下载编译依赖包（GitHub优先，官方备用）
+      if: steps.cache-dl.outputs.cache-hit != 'true'
       run: |
         cd openwrt
         make defconfig
@@ -186,6 +210,13 @@ jobs:
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
         echo -e "\033[32m✅ 依赖包下载完成\033[0m"
+
+    # 依赖缓存命中提示
+    - name: 依赖缓存命中提示
+      if: steps.cache-dl.outputs.cache-hit == 'true'
+      run: |
+        echo -e "\033[32m✅ 依赖包缓存命中，跳过下载步骤\033[0m"
+        ls -lh ./openwrt/dl
 
     - name: 生成编译任务列表
       run: |
