@@ -10,7 +10,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-20.04  # 改用20.04，更兼容21.02依赖
 
     steps:
     - name: 检出代码仓库
@@ -18,15 +18,15 @@ jobs:
       with:
         fetch-depth: 1
 
-    - name: 配置编译环境（消除apt警告）
+    - name: 配置编译环境（消除apt警告+修复权限问题）
       env:
         DEBIAN_FRONTEND: noninteractive
         APT_LISTCHANGES_FRONTEND: none
         APT_OPTIONS: '-o Dpkg::Use-Pty=0 -o APT::Color=0 -q'
       run: |
-        # 添加兼容源，解决21.02依赖包找不到的问题
-        sudo echo "deb http://archive.ubuntu.com/ubuntu/ jammy universe" >> /etc/apt/sources.list
-        sudo echo "deb http://archive.ubuntu.com/ubuntu/ jammy-updates universe" >> /etc/apt/sources.list
+        # 正确写法：用tee + sudo 提权写入源文件，> /dev/null 屏蔽多余输出
+        echo "deb http://archive.ubuntu.com/ubuntu/ focal universe" | sudo tee -a /etc/apt/sources.list > /dev/null
+        echo "deb http://archive.ubuntu.com/ubuntu/ focal-updates universe" | sudo tee -a /etc/apt/sources.list > /dev/null
         
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo apt-get update -y $APT_OPTIONS
@@ -42,9 +42,7 @@ jobs:
       run: |
         git clone https://git.openwrt.org/openwrt/openwrt.git openwrt
         cd openwrt
-        # 切换到21.02.7稳定标签（移除git pull，避免detached HEAD报错）
         git checkout v21.02.7
-        # 验证版本
         echo "当前OpenWRT版本：$(git describe --tags)"
 
     - name: 复制仓库根目录的.config到OpenWRT源码目录
@@ -58,17 +56,20 @@ jobs:
           exit 1
         fi
 
-    - name: 更新feeds并安装
+    - name: 更新feeds并安装（增加重试+国内镜像）
       run: |
         cd openwrt
-        ./scripts/feeds update -a
+        # 替换feeds源为清华镜像，解决下载慢/失败问题
+        sed -i 's#git.openwrt.org#mirrors.tuna.tsinghua.edu.cn/openwrt#' feeds.conf.default
+        # 增加重试机制
+        ./scripts/feeds update -a || ./scripts/feeds update -a || ./scripts/feeds update -a
         ./scripts/feeds install -a
 
-    - name: 下载编译依赖包
+    - name: 下载编译依赖包（降低并发）
       run: |
         cd openwrt
         make defconfig
-        # 降低并发数，避免下载失败
+        # 单线程下载，避免网络问题
         make download -j1 V=s || make download -j1 V=s
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
@@ -82,7 +83,7 @@ jobs:
         echo "TOTAL_TASKS=$TOTAL_TASKS" >> $GITHUB_ENV
         rm -f build_tasks.log
 
-    - name: 开始编译（带实时进度显示）
+    - name: 开始编译（带实时进度+低并发）
       run: |
         cd openwrt
         cat > progress_monitor.sh << 'EOF'
@@ -106,7 +107,7 @@ jobs:
         MONITOR_PID=$!
         
         echo -e "\033[34m🚀 开始编译OpenWRT 21.02，总任务数: $TOTAL_TASKS\033[0m"
-        # 降低并发数，避免GitHub资源超限
+        # 低并发编译，避免资源超限
         make -j2 V=s 2>&1 | tee build.log || make -j1 V=s 2>&1 | tee -a build.log
         
         kill $MONITOR_PID
@@ -129,13 +130,14 @@ jobs:
         path: ./openwrt-firmware/
         retention-days: 7
 
-    - name: 推送固件到仓库根目录
+    - name: 推送固件到仓库根目录（修复分支参数）
       if: success()
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
+        # 指定分支拉取，避免歧义
         git pull origin ${{ github.ref_name }} --rebase
         git add ./openwrt-firmware/
         git commit -m "Add OpenWRT 21.02 firmware build at $(date +'%Y-%m-%d %H:%M:%S')" || echo "无新固件需要提交"
